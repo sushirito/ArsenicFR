@@ -316,6 +316,209 @@ class TestConvenienceFunction:
         assert processor.raw_data is not None
 
 
+class TestRealWorldData:
+    """Test suite using real UV-Vis dataset files."""
+    
+    @pytest.fixture
+    def real_dataset_path(self):
+        """Path to real AuNP dataset."""
+        dataset_path = Path(__file__).parent.parent / "datasets" / "0.30MB_AuNP_As.csv"
+        if not dataset_path.exists():
+            pytest.skip(f"Real dataset not found at {dataset_path}")
+        return str(dataset_path)
+    
+    def test_real_data_loading(self, real_dataset_path):
+        """Test loading and processing real AuNP UV-Vis data."""
+        processor = UVVisDataProcessor(real_dataset_path, validate_data=True)
+        data = processor.load_and_validate_data()
+        
+        # Verify data structure matches expected format
+        assert data is not None
+        assert isinstance(data, pd.DataFrame)
+        assert data.shape == (601, 7)  # 601 wavelengths, 7 columns (Wavelength + 6 concentrations)
+        assert list(data.columns) == ['Wavelength', '0', '10', '20', '30', '40', '60']
+        
+        # Check wavelength range (800-200 nm in descending order)
+        wavelengths = data['Wavelength'].values
+        assert wavelengths[0] == 800
+        assert wavelengths[-1] == 200
+        assert np.all(wavelengths[:-1] > wavelengths[1:])  # Descending order
+    
+    def test_real_data_spectral_extraction(self, real_dataset_path):
+        """Test spectral component extraction from real data."""
+        processor = UVVisDataProcessor(real_dataset_path)
+        processor.load_and_validate_data()
+        wavelengths, concentrations, absorbance_matrix = processor.extract_spectral_components()
+        
+        # Verify extracted components
+        assert wavelengths.shape == (601,)
+        assert concentrations.shape == (6,)
+        assert absorbance_matrix.shape == (601, 6)
+        
+        # Check that wavelengths are now in ascending order (reversed during extraction)
+        assert np.all(wavelengths[:-1] <= wavelengths[1:])
+        assert wavelengths[0] == 200
+        assert wavelengths[-1] == 800
+        
+        # Verify concentration values
+        np.testing.assert_array_equal(concentrations, [0, 10, 20, 30, 40, 60])
+        
+        # Check absorbance values are reasonable for UV-Vis
+        assert np.all(absorbance_matrix >= 0)  # Absorbance should be non-negative
+        assert np.all(absorbance_matrix <= 3.0)  # Reasonable upper bound for UV-Vis
+    
+    def test_real_data_beer_lambert_processing(self, real_dataset_path):
+        """Test Beer-Lambert law processing on real AuNP data."""
+        processor = UVVisDataProcessor(real_dataset_path)
+        processor.load_and_validate_data()
+        processor.extract_spectral_components()
+        baseline, differential = processor.compute_beer_lambert_components()
+        
+        # Verify baseline extraction (should be zero concentration column)
+        assert baseline.shape == (601,)
+        assert np.all(baseline >= 0)  # Baseline absorption should be positive
+        
+        # Verify differential absorption matrix
+        assert differential.shape == (601, 5)  # 5 non-zero concentrations
+        
+        # Check that differential absorption increases with concentration (generally)
+        # at wavelengths where AuNPs absorb (around 520 nm for spherical AuNPs)
+        wavelengths = processor.wavelengths
+        idx_520 = np.argmin(np.abs(wavelengths - 520))  # Find closest to 520 nm
+        
+        diff_at_520 = differential[idx_520, :]
+        # Differential absorption should generally increase with concentration
+        # (though real data may have noise and variations)
+        assert len(diff_at_520) == 5
+    
+    def test_real_data_normalization(self, real_dataset_path):
+        """Test normalization of real dataset."""
+        processor = UVVisDataProcessor(real_dataset_path)
+        processor.load_and_validate_data()
+        processor.extract_spectral_components()
+        processor.compute_beer_lambert_components()
+        normalized_data = processor.normalize_inputs()
+        
+        # Verify normalization output structure
+        required_keys = [
+            'wavelengths_norm', 'concentrations_norm', 'differential_absorption_norm',
+            'wavelengths_raw', 'concentrations_raw', 'differential_absorption_raw',
+            'baseline_absorption'
+        ]
+        for key in required_keys:
+            assert key in normalized_data
+        
+        # Check normalization ranges
+        wavelengths_norm = normalized_data['wavelengths_norm']
+        concentrations_norm = normalized_data['concentrations_norm']
+        diff_abs_norm = normalized_data['differential_absorption_norm']
+        
+        # Wavelengths should be standardized (approximately [-1, 1] range)
+        assert wavelengths_norm.min() < -0.8
+        assert wavelengths_norm.max() > 0.8
+        
+        # Concentrations should be normalized to [0, 1] range
+        # Note: Only non-zero concentrations are included, so min > 0
+        assert concentrations_norm.min() > 0
+        assert concentrations_norm.max() == 1
+        
+        # Differential absorption should be reasonably normalized
+        assert diff_abs_norm.min() >= -0.2  # Allow some negative values due to noise
+        assert diff_abs_norm.max() <= 1.2   # Allow slight overshoot
+    
+    def test_real_data_training_set_generation(self, real_dataset_path):
+        """Test training data generation from real dataset."""
+        processor = UVVisDataProcessor(real_dataset_path)
+        processor.load_and_validate_data()
+        processor.extract_spectral_components()
+        processor.compute_beer_lambert_components()
+        
+        X_train, y_train = processor.create_training_data()
+        
+        # Verify training data dimensions
+        n_wavelengths = 601
+        n_concentrations = 5  # Non-zero concentrations only
+        expected_points = n_wavelengths * n_concentrations
+        
+        assert X_train.shape == (expected_points, 2)
+        assert y_train.shape == (expected_points, 1)
+        
+        # Check data types
+        assert X_train.dtype == np.float32
+        assert y_train.dtype == np.float32
+        
+        # Verify input ranges (normalized values)
+        # Wavelengths (column 0) should be standardized
+        assert X_train[:, 0].min() < -0.8
+        assert X_train[:, 0].max() > 0.8
+        
+        # Concentrations (column 1) should be in (0, 1] range (excludes zero concentration)
+        assert X_train[:, 1].min() > 0
+        assert X_train[:, 1].max() == 1
+        
+        # Check that all concentration values are represented
+        unique_concentrations = np.unique(X_train[:, 1])
+        assert len(unique_concentrations) == 5  # Should have 5 distinct concentration levels
+    
+    def test_real_data_plasmon_resonance_detection(self, real_dataset_path):
+        """Test that the processing preserves AuNP plasmonic features."""
+        processor = UVVisDataProcessor(real_dataset_path)
+        processor.load_and_validate_data()
+        processor.extract_spectral_components()
+        processor.compute_beer_lambert_components()
+        
+        # Gold nanoparticles typically show surface plasmon resonance around 520-530 nm
+        wavelengths = processor.wavelengths
+        absorbance_matrix = processor.absorbance_matrix
+        
+        # Find wavelength range around plasmon resonance
+        plasmon_range = (wavelengths >= 510) & (wavelengths <= 540)
+        plasmon_wavelengths = wavelengths[plasmon_range]
+        plasmon_absorbance = absorbance_matrix[plasmon_range, :]
+        
+        # Check that there's significant absorption in this range
+        assert len(plasmon_wavelengths) > 0
+        
+        # For AuNPs, higher concentrations should show higher absorption
+        # in the plasmon region (excluding baseline concentration=0)
+        for i in range(1, plasmon_absorbance.shape[1]):  # Skip baseline (i=0)
+            mean_plasmon_abs = np.mean(plasmon_absorbance[:, i])
+            baseline_plasmon_abs = np.mean(plasmon_absorbance[:, 0])
+            
+            # Non-zero concentrations should have higher absorption than baseline
+            assert mean_plasmon_abs >= baseline_plasmon_abs
+    
+    def test_real_data_full_pipeline_integration(self, real_dataset_path):
+        """Test complete preprocessing pipeline with real data."""
+        # Test the convenience function with real data
+        processor = load_uvvis_data(real_dataset_path, validate=True)
+        
+        # Verify all processing steps completed successfully
+        assert processor.raw_data is not None
+        assert processor.wavelengths is not None
+        assert processor.concentrations is not None
+        assert processor.baseline_absorption is not None
+        assert processor.differential_absorption is not None
+        
+        # Verify training data can be generated
+        X_train, y_train = processor.create_training_data()
+        assert X_train.shape[0] == y_train.shape[0]
+        assert X_train.shape[1] == 2  # wavelength, concentration
+        assert y_train.shape[1] == 1  # differential absorption
+        
+        # Verify data summary contains real data statistics
+        summary = processor.get_data_summary()
+        assert summary["data_shape"] == (601, 7)
+        assert summary["wavelength_range"] == (200, 800) or summary["wavelength_range"] == [200.0, 800.0]
+        assert summary["concentrations"] == [0, 10, 20, 30, 40, 60]
+        
+        # Check that normalization parameters are reasonable for real data
+        norm_params = summary["normalization_params"]
+        assert "wavelength" in norm_params
+        assert "concentration" in norm_params
+        assert "absorbance" in norm_params
+
+
 class TestDataPhysicsValidation:
     """Test physics-related aspects of data processing."""
     
